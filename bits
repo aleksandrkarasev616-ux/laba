@@ -1,0 +1,129 @@
+#include "bits.h"
+
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <stdexcept>
+
+namespace bits {
+
+namespace {
+
+// Переинтерпретация битов через memcpy (без UB, в отличие от чтения неактивного поля union)
+template <class To, class From>
+To reinterpretBits(const From& from) {
+    static_assert(sizeof(To) == sizeof(From), "размеры типов должны совпадать");
+    To to;
+    std::memcpy(&to, &from, sizeof(To));
+    return to;
+}
+
+// Одна функция для всех разрядностей: &= ~mask, |= mask, ^= mask
+template <class U>
+U applyOp(U value, int pos, BitOp op) {
+    const int width = static_cast<int>(sizeof(U) * 8);
+    if (pos < 0 || pos >= width)
+        throw std::out_of_range("номер бита должен быть в диапазоне 0.." + std::to_string(width - 1));
+
+    const U mask = static_cast<U>(U(1) << pos);
+    switch (op) {
+        case BitOp::Clear:  return static_cast<U>(value & ~mask);
+        case BitOp::Set:    return static_cast<U>(value | mask);
+        case BitOp::Toggle: return static_cast<U>(value ^ mask);
+    }
+    throw std::invalid_argument("неизвестная операция");
+}
+
+std::string kindName(int c) {
+    switch (c) {
+        case FP_ZERO:      return "ноль";
+        case FP_SUBNORMAL: return "денормализованное";
+        case FP_NORMAL:    return "нормализованное";
+        case FP_INFINITE:  return "бесконечность";
+        default:           return "NaN";
+    }
+}
+
+}  // namespace
+
+void printTypeSizes() {
+    struct Row { const char* name; std::size_t size; const char* note; };
+    const Row rows[] = {
+        {"bool",        sizeof(bool),        "логический тип (true/false)"},
+        {"char",        sizeof(char),        "один символ"},
+        {"short int",   sizeof(short int),   "короткое целое число"},
+        {"int",         sizeof(int),         "обычное целое число"},
+        {"long int",    sizeof(long int),    "4 байта в Windows, 8 в Linux (зависит от платформы)"},
+        {"long long",   sizeof(long long),   "очень длинное целое число"},
+        {"float",       sizeof(float),       "дробное число одинарной точности (binary32)"},
+        {"double",      sizeof(double),      "дробное число двойной точности (binary64)"},
+        {"long double", sizeof(long double), "расширенная точность (8/12/16 байт, зависит от компилятора)"},
+    };
+    std::cout << std::left;
+    for (const Row& r : rows)
+        std::cout << std::setw(12) << r.name << " - " << std::setw(2) << r.size << " - " << r.note << "\n";
+    std::cout << std::right;
+}
+
+std::string groupedBits(std::uint64_t value, int width, const std::vector<int>& groups) {
+    std::string out;
+    int bit = width - 1;
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+        if (g) out += " | ";
+        for (int i = 0; i < groups[g]; ++i, --bit)
+            out += ((value >> bit) & 1u) ? '1' : '0';
+    }
+    return out;
+}
+
+std::string intBits(std::int32_t value)   { return groupedBits(static_cast<std::uint32_t>(value), 32, {1, 31}); }
+std::string uintBits(std::uint32_t value) { return groupedBits(value, 32, {32}); }
+std::string floatBits(float value)        { return groupedBits(reinterpretBits<std::uint32_t>(value), 32, {1, 8, 23}); }
+std::string doubleBits(double value)      { return groupedBits(reinterpretBits<std::uint64_t>(value), 64, {1, 11, 52}); }
+
+std::string floatKind(float value)   { return kindName(std::fpclassify(value)); }
+std::string doubleKind(double value) { return kindName(std::fpclassify(value)); }
+
+void printIntCodes(std::int32_t value) {
+    const std::uint32_t u = static_cast<std::uint32_t>(value);
+    std::uint32_t direct = u, inverse = u, additional = u;
+
+    if (value < 0) {
+        const std::uint32_t magnitude = 0u - u;  // |value|
+        if (magnitude > 0x7FFFFFFFu) {
+            std::cout << "  для INT_MIN прямой и обратный коды в 32 битах не существуют\n"
+                      << "  дополнительный: " << intBits(value) << "\n";
+            return;
+        }
+        direct     = 0x80000000u | magnitude;  // знак + модуль
+        inverse    = direct ^ 0x7FFFFFFFu;     // инверсия значащих разрядов
+        additional = inverse + 1u;             // обратный + 1 == реальное представление
+    }
+    std::cout << "  прямой:         " << intBits(static_cast<std::int32_t>(direct)) << "\n"
+              << "  обратный:       " << intBits(static_cast<std::int32_t>(inverse)) << "\n"
+              << "  дополнительный: " << intBits(static_cast<std::int32_t>(additional)) << "\n";
+}
+
+std::int32_t changeBit(std::int32_t value, int pos, BitOp op) {
+    return static_cast<std::int32_t>(applyOp(static_cast<std::uint32_t>(value), pos, op));
+}
+
+float changeBit(float value, int pos, BitOp op) {
+    return reinterpretBits<float>(applyOp(reinterpretBits<std::uint32_t>(value), pos, op));
+}
+
+double changeBit(double value, int pos, BitOp op) {
+    return reinterpretBits<double>(applyOp(reinterpretBits<std::uint64_t>(value), pos, op));
+}
+
+std::int32_t mulBy2(std::int32_t value, bool& overflow) {
+    // Сдвигаем беззнаковое: сдвиг влево знакового отрицательного/переполняющегося числа
+    // до C++20 является неопределённым поведением.
+    const std::uint32_t u = static_cast<std::uint32_t>(value);
+    // Удвоение помещается в 32 бита со знаком, только если бит 31 == бит 30
+    overflow = ((u >> 31) & 1u) != ((u >> 30) & 1u);
+    return static_cast<std::int32_t>(u << 1);
+}
+
+}  // namespace bits
